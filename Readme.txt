@@ -12,6 +12,7 @@ Files:
     DataPreppy.py : Class for converting data to tfrecord and also method to read dataset from these records. 
     data_preprocessing.py: scripts to clean the input data.
     create_tfrecords.py: create tfrecords for training/eval.
+    RnnLm.py: main model 
 
 
 Steps:
