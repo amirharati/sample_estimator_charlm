@@ -6,30 +6,92 @@
 
 import DataPreppy as DP
 import tensorflow as tf
+import numpy as np
 
 class RnnLm:
     def __init__(self, model_size, embedding_size, num_layers,
-         keep_prob, vocabs, batch_size, num_itr, train_tfrecords, eval_tfrecords,
+         keep_prob, vocabs, reverse_vocabs, batch_size, num_itr, train_tfrecords, eval_tfrecords,
          model_dir):
         self.params = dict()
         self.params["model_size"] = model_size
         self.params["embedding_size"] = embedding_size
         self.params["num_layers"] = num_layers
         self.params["keep_prob"] = keep_prob
-        self.params["vocab_size"] = len(vocabs)
+        self.vocab_size = len(vocabs)
+        self.params["vocab_size"] = self.vocab_size
 
         self.batch_size = batch_size
         self.num_itr = num_itr
         self.train_tfrecords = train_tfrecords
         self.eval_tfrecords = eval_tfrecords
         self.model_dir = model_dir
+        self.vocabs = vocabs
+        self.reverse_vocabs = reverse_vocabs
 
     def train(self):
-        charlm = tf.estimator.Estimator(
+        """
+            train the custom estimator.
+        """
+        est = tf.estimator.Estimator(
             model_fn=self._model,
             model_dir=self.model_dir,
             params=self.params)
-        charlm.train(self._train_input_fn, steps=self.num_itr)
+        est.train(self._train_input_fn, steps=self.num_itr)
+
+    def generate(self):
+        """
+            generate new sequences.
+        """
+        model_size = self.params["model_size"]
+        
+        num_layers = self.params["num_layers"]
+        est = tf.estimator.Estimator(
+            model_fn=self._model,
+            model_dir=self.model_dir,
+            params=self.params,
+            warm_start_from=self.model_dir)
+        
+        current_seq_ind = []
+        max_len = 100
+        itr = 0
+        p = (1.0 / (self.vocab_size)) * np.ones(self.vocab_size)
+        
+        s = np.zeros((1, model_size*num_layers), dtype=np.float32)
+       
+        while itr < max_len:
+            ind_sample = np.random.choice(range(0, self.vocab_size), p=p.ravel())
+            
+            # done if <EOS> observed.
+            if self.reverse_vocabs[ind_sample] == "<EOS>":  # EOS token
+                break
+            # sentence always start with <START>    
+            if itr == 0:
+                ind_sample = self.vocabs["<START>"]
+            else:
+                current_seq_ind.append(ind_sample)
+            
+            X = np.zeros((1, 1), dtype=np.int32)
+            X[0, 0] = ind_sample
+            predict_input_fn = tf.estimator.inputs.numpy_input_fn(
+                x={"seq": X, "state": s},
+                num_epochs=1,
+                shuffle=False)
+            
+            result = est.predict(input_fn=predict_input_fn)
+      
+            g = next(result)
+            p = g["probs"]
+            s = np.array(g["state"], dtype=np.float32)
+            s=np.expand_dims(s,axis=0)
+           
+            #except:
+                #print("###")
+            itr += 1
+        self.reverse_vocabs[3] = " "
+        out_str = ""
+        for c in current_seq_ind:
+            out_str += self.reverse_vocabs[c] 
+        print(out_str)
 
     def _train_input_fn(self):
         return DP.DataPreppy.make_dataset(self.train_tfrecords, "train", self.batch_size)
@@ -46,8 +108,14 @@ class RnnLm:
         # How to update the params such as keep_prob during training? It seems we need to divide the  training into chunks
         # and check for conditons in between chunks.
         sequence = features['seq']
-        lengths = features['length']
+        if mode == tf.estimator.ModeKeys.PREDICT:
+            lengths = [1] 
+        else:
+            lengths = features['length']
+        if mode == tf.estimator.ModeKeys.PREDICT:
+            init_state = features["state"]
         model_size = params["model_size"]
+        
         num_layers = params["num_layers"]
         keep_prob = params["keep_prob"]
         vocab_size = params["vocab_size"]
@@ -63,12 +131,22 @@ class RnnLm:
                 c = tf.nn.rnn_cell.DropoutWrapper(c, input_keep_prob=keep_prob,
                                                 output_keep_prob=keep_prob)
                 cells.append(c)
-            cell = tf.nn.rnn_cell.MultiRNNCell(cells)
+            # I cant figure out how to use tuple version.    
+            cell = tf.nn.rnn_cell.MultiRNNCell(cells, state_is_tuple=False) 
+           
+        
             # run the rnn
-            outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, sequence_length=lengths, scope="DRNN")
-
+            if mode == tf.estimator.ModeKeys.PREDICT:            
+                outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, initial_state=init_state, scope="DRNN")
+            else:
+                outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, sequence_length=lengths, scope="DRNN")
+    
+    
             targets = sequence[:, 1:]
-            outputs = outputs[:, :-1, :]
+            # for predict we use the output for train exclude the last timestep
+            if mode == tf.estimator.ModeKeys.TRAIN:
+                outputs = outputs[:, :-1, :]
+
             with tf.variable_scope("softmax"):
                 logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
                 probs = tf.nn.softmax(logits, name="probs")
@@ -76,7 +154,7 @@ class RnnLm:
                 if mode == tf.estimator.ModeKeys.PREDICT:
                     return tf.estimator.EstimatorSpec(
                         mode=mode,
-                        predictions={"probs": probs})
+                        predictions={"probs": probs ,"state": tf.convert_to_tensor(state)})
 
                 mask = tf.sign(tf.abs(tf.cast(targets, dtype=tf.float32)))
                 #loss = tf.contrib.seq2seq.sequence_loss(logits, targets,
@@ -113,3 +191,16 @@ class RnnLm:
                 loss=loss,
                 train_op=train_op
             )
+
+def test():
+    dpp = DP.DataPreppy("char", "./data/annakarenina_chars2id.txt", "", "")
+    m = RnnLm(model_size=128, embedding_size=100, num_layers=1,
+         keep_prob=1.0, batch_size=64, num_itr=200, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
+         train_tfrecords='./data/annakarenina_char-train.tfrecord',
+         eval_tfrecords='./data/annakarenina_char-eval.tfrecord',
+         model_dir="./checkpoints")
+    m.train()
+    m.generate()
+
+if __name__ == "__main__":
+    test()
