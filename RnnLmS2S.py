@@ -14,6 +14,15 @@ import numpy as np
 from tensorflow.python.layers.core import Dense
 import logging
 
+# Fix for chnaging len error:
+# from: https://github.com/tensorflow/nmt/issues/117
+class FixedHelper(tf.contrib.seq2seq.GreedyEmbeddingHelper):
+    def sample(self, *args, **kwargs):
+        batch_size = 1
+        result = super().sample(*args, **kwargs)
+        result.set_shape([batch_size])
+        return result
+
 class RnnLmS2S:
     def __init__(self, model_size, embedding_size, num_layers,
          keep_prob, vocabs, reverse_vocabs, batch_size, num_itr, train_tfrecords, eval_tfrecords,
@@ -31,6 +40,7 @@ class RnnLmS2S:
         self.train_tfrecords = train_tfrecords
         self.eval_tfrecords = eval_tfrecords
         self.model_dir = model_dir
+        self.vocabs = vocabs
         self.reverse_vocabs = reverse_vocabs
 
     def train(self):
@@ -57,46 +67,15 @@ class RnnLmS2S:
             warm_start_from=self.model_dir)
         
         current_seq_ind = []
-        max_len = 100
-        itr = 0
-        p = (1.0 / (self.vocab_size)) * np.ones(self.vocab_size)
-        
-        s = np.zeros((1, model_size*num_layers), dtype=np.float32)
-       
-        while itr < max_len:
-            ind_sample = np.random.choice(range(0, self.vocab_size), p=p.ravel())
+        X = np.zeros((1, 1), dtype=np.int32)
+        X[0, 0] = 0
+        predict_input_fn = tf.estimator.inputs.numpy_input_fn(
+            x={"seq": X},
+            num_epochs=1,
+            shuffle=False)
             
-            # done if <EOS> observed.
-            if self.reverse_vocabs[ind_sample] == "<EOS>":  # EOS token
-                break
-            # sentence always start with <START>    
-            if itr == 0:
-                ind_sample = self.vocabs["<START>"]
-            else:
-                current_seq_ind.append(ind_sample)
-            
-            X = np.zeros((1, 1), dtype=np.int32)
-            X[0, 0] = ind_sample
-            predict_input_fn = tf.estimator.inputs.numpy_input_fn(
-                x={"seq": X, "state": s},
-                num_epochs=1,
-                shuffle=False)
-            
-            result = est.predict(input_fn=predict_input_fn)
-      
-            g = next(result)
-            p = g["probs"]
-            s = np.array(g["state"], dtype=np.float32)
-            s=np.expand_dims(s,axis=0)
-           
-            #except:
-                #print("###")
-            itr += 1
-        self.reverse_vocabs[3] = " "
-        out_str = ""
-        for c in current_seq_ind:
-            out_str += self.reverse_vocabs[c] 
-        print(out_str)
+        result = est.predict(input_fn=predict_input_fn)
+        print(next(result))
 
     def _train_input_fn(self):
         return DP.DataPreppy.make_dataset(self.train_tfrecords, "train", self.batch_size)
@@ -117,13 +96,19 @@ class RnnLmS2S:
         #    lengths = 0 
 
         #else:
-        lengths = features['length']
-        sequence = features['seq']
-        batch_size = tf.shape(sequence)[0]
-        #if mode == tf.estimator.ModeKeys.PREDICT:
-        #    init_state = features["state"]
+        if mode == tf.estimator.ModeKeys.TRAIN:
+            lengths = features['length']
+            sequence = features['seq']
+            batch_size = tf.shape(sequence)[0]
+            start_token = tf.ones([self.vocabs["<START>"]], tf.int32) 
+        elif mode == tf.estimator.ModeKeys.PREDICT:
+            start_token = tf.ones([self.vocabs["<START>"]], tf.int32) # update this
+            batch_size = 1
+            #sequence = self.vocabs["<START>"]
+            sequence = features['seq']
+            lengths = [1]
+
         model_size = params["model_size"]
-        
         num_layers = params["num_layers"]
         keep_prob = params["keep_prob"]
         vocab_size = params["vocab_size"]
@@ -132,10 +117,13 @@ class RnnLmS2S:
         with tf.variable_scope("main", initializer=tf.contrib.layers.xavier_initializer()):
             embedding = tf.get_variable("embedding",
             [vocab_size, embedding_size], dtype=tf.float32)
+            #if mode == tf.estimator.ModeKeys.TRAIN:
             embed_seq = tf.nn.embedding_lookup(embedding, sequence)
-            
-            output_lengths = tf.reduce_sum(tf.to_int32(tf.not_equal(sequence, 0)), 1)
+            output_lengths = tf.reduce_sum(tf.to_int32(tf.not_equal(sequence, 0)), 1)  #update this
             train_helper = tf.contrib.seq2seq.TrainingHelper(embed_seq, output_lengths)
+            #if mode == tf.estimator.ModeKeys.PREDICT:
+            pred_helper = FixedHelper(embedding, 
+                    start_tokens=tf.to_int32(start_token), end_token=2) # update this
 
             def decode(helper, scope, reuse=None):
                 with tf.variable_scope(scope, reuse=reuse):
@@ -147,7 +135,7 @@ class RnnLmS2S:
                         cells.append(c)   
                     cell = tf.nn.rnn_cell.MultiRNNCell(cells) 
                     #out_cell = tf.contrib.rnn.OutputProjectionWrapper(cell, vocab_size, reuse=reuse)
-                    projection_layer = Dense(units=vocab_size, use_bias=True)
+                    projection_layer = Dense(units=vocab_size, use_bias=True, name="logits")
                     decoder = tf.contrib.seq2seq.BasicDecoder(
                         cell=cell, helper=helper,
                         initial_state=cell.zero_state(dtype=tf.float32, batch_size=batch_size),
@@ -156,8 +144,14 @@ class RnnLmS2S:
                         decoder=decoder, output_time_major=False,
                         impute_finished=True)
                     return outputs
+            #if mode == tf.estimator.ModeKeys.TRAIN:
             train_outputs = decode(train_helper, 'decode')
-            outputs = train_outputs.rnn_output
+            #elif mode == tf.estimator.ModeKeys.PREDICT:
+            pred_outputs = decode(pred_helper, 'decode', reuse=True)
+            if mode == tf.estimator.ModeKeys.TRAIN:
+                outputs = train_outputs.rnn_output
+            elif mode == tf.estimator.ModeKeys.PREDICT:
+                outputs = pred_outputs.rnn_output
 
             # run the rnn
             #if mode == tf.estimator.ModeKeys.PREDICT:            
@@ -165,10 +159,9 @@ class RnnLmS2S:
             #else:
             #    outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, sequence_length=lengths, scope="DRNN")
     
-    
-            targets = sequence[:, 1:]
-            # for predict we use the output for train exclude the last timestep
             if mode == tf.estimator.ModeKeys.TRAIN:
+                targets = sequence[:, 1:]
+                # for predict we use the output for train exclude the last timestep
                 outputs = outputs[:, :-1, :]
 
             with tf.variable_scope("softmax"):
@@ -176,13 +169,13 @@ class RnnLmS2S:
                 # alternatively we can remove projection layer above and change the logits to below.
                 #logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
                 
-
+                # probablities.
                 probs = tf.nn.softmax(logits, name="probs")
                 # in case in prediction mode return
-                #    if mode == tf.estimator.ModeKeys.PREDICT:
-                #        return tf.estimator.EstimatorSpec(
-                #            mode=mode,
-                #            predictions={"probs": probs ,"state": tf.convert_to_tensor(state)})
+                if mode == tf.estimator.ModeKeys.PREDICT:
+                        return tf.estimator.EstimatorSpec(
+                            mode=mode,
+                            predictions={"probs": probs})
 
                 mask = tf.sign(tf.abs(tf.cast(targets, dtype=tf.float32)))
                 loss = tf.contrib.seq2seq.sequence_loss(logits, targets,
@@ -222,15 +215,15 @@ class RnnLmS2S:
             )
 
 def test():
-    tf.logging.set_verbosity(logging.INFO)
+    tf.logging.set_verbosity(logging.DEBUG)
     dpp = DP.DataPreppy("char", "./data/annakarenina_chars2id.txt", "", "")
     m = RnnLmS2S(model_size=128, embedding_size=100, num_layers=1,
-         keep_prob=1.0, batch_size=64, num_itr=500, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
+         keep_prob=1.0, batch_size=64, num_itr=200, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
          train_tfrecords='./data/annakarenina_char-train.tfrecord',
          eval_tfrecords='./data/annakarenina_char-eval.tfrecord',
          model_dir="./checkpoints")
-    m.train()
-    #m.generate()
+    #m.train()
+    m.generate()
 
 if __name__ == "__main__":
     test()
