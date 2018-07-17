@@ -12,6 +12,7 @@ import DataPreppy as DP
 import tensorflow as tf
 import numpy as np
 from tensorflow.python.layers.core import Dense
+import logging
 
 class RnnLmS2S:
     def __init__(self, model_size, embedding_size, num_layers,
@@ -143,16 +144,14 @@ class RnnLmS2S:
                         c = tf.nn.rnn_cell.GRUCell(model_size)
                         c = tf.nn.rnn_cell.DropoutWrapper(c, input_keep_prob=keep_prob,
                                                         output_keep_prob=keep_prob)
-                        cells.append(c)
-                    # I cant figure out how to use tuple version.    
+                        cells.append(c)   
                     cell = tf.nn.rnn_cell.MultiRNNCell(cells) 
                     #out_cell = tf.contrib.rnn.OutputProjectionWrapper(cell, vocab_size, reuse=reuse)
                     projection_layer = Dense(units=vocab_size, use_bias=True)
                     decoder = tf.contrib.seq2seq.BasicDecoder(
                         cell=cell, helper=helper,
-                        initial_state=cell.zero_state(dtype=tf.float32, batch_size=batch_size))
-                        #output_layer=projection_layer)
-                
+                        initial_state=cell.zero_state(dtype=tf.float32, batch_size=batch_size),
+                        output_layer=projection_layer)
                     outputs, _, _ = tf.contrib.seq2seq.dynamic_decode(
                         decoder=decoder, output_time_major=False,
                         impute_finished=True)
@@ -173,7 +172,11 @@ class RnnLmS2S:
                 outputs = outputs[:, :-1, :]
 
             with tf.variable_scope("softmax"):
-                logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
+                logits = outputs
+                # alternatively we can remove projection layer above and change the logits to below.
+                #logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
+                
+
                 probs = tf.nn.softmax(logits, name="probs")
                 # in case in prediction mode return
                 #    if mode == tf.estimator.ModeKeys.PREDICT:
@@ -187,9 +190,9 @@ class RnnLmS2S:
                                                         average_across_timesteps=False,
                                                         average_across_batch=True)
                 # alternative loss
-             #   loss = tf.losses.sparse_softmax_cross_entropy(targets,
-             #                                       logits,
-             #                                       weights=mask)
+                #loss = tf.losses.sparse_softmax_cross_entropy(targets,
+                #                                       logits,
+                #                                       weights=mask)
 
 
             # compute the loss and also predictions
@@ -208,7 +211,8 @@ class RnnLmS2S:
                 vis_grads = [0 if i is None else i for i in grads]
                 for g in vis_grads:
                     tf.summary.histogram("gradients_" + str(g), g)
-                train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=tf.train.get_global_step())
+                train_op = optimizer.apply_gradients(zip(grads, tvars),
+                 global_step=tf.train.get_global_step())
 
             return tf.estimator.EstimatorSpec(
                 mode=mode,
@@ -218,6 +222,7 @@ class RnnLmS2S:
             )
 
 def test():
+    tf.logging.set_verbosity(logging.INFO)
     dpp = DP.DataPreppy("char", "./data/annakarenina_chars2id.txt", "", "")
     m = RnnLmS2S(model_size=128, embedding_size=100, num_layers=1,
          keep_prob=1.0, batch_size=64, num_itr=500, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
