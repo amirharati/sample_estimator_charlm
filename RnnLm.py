@@ -7,6 +7,7 @@
 import DataPreppy as DP
 import tensorflow as tf
 import numpy as np
+import logging
 
 class RnnLm:
     def __init__(self, model_size, embedding_size, num_layers,
@@ -32,11 +33,13 @@ class RnnLm:
         """
             train the custom estimator.
         """
+        print_logs = tf.train.LoggingTensorHook(
+        ['main/softmax/xyz'], every_n_iter=100)
         est = tf.estimator.Estimator(
             model_fn=self._model,
             model_dir=self.model_dir,
             params=self.params)
-        est.train(self._train_input_fn, steps=self.num_itr)
+        est.train(self._train_input_fn, hooks=[print_logs], steps=self.num_itr)
 
     def generate(self):
         """
@@ -148,13 +151,15 @@ class RnnLm:
                 outputs = outputs[:, :-1, :]
 
             with tf.variable_scope("softmax"):
-                logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
+                logits = tf.layers.dense(outputs, vocab_size, None, name="logits2")
                 probs = tf.nn.softmax(logits, name="probs")
                 # in case in prediction mode return
                 if mode == tf.estimator.ModeKeys.PREDICT:
                     return tf.estimator.EstimatorSpec(
                         mode=mode,
                         predictions={"probs": probs ,"state": tf.convert_to_tensor(state)})
+
+                tf.identity(logits[0,lengths[0]-2:lengths[0],:], name='xyz')
 
                 mask = tf.sign(tf.abs(tf.cast(targets, dtype=tf.float32)))
                 #loss = tf.contrib.seq2seq.sequence_loss(logits, targets,
@@ -193,13 +198,14 @@ class RnnLm:
             )
 
 def test():
+    tf.logging.set_verbosity(logging.DEBUG)
     dpp = DP.DataPreppy("char", "./data/annakarenina_chars2id.txt", "", "")
     m = RnnLm(model_size=128, embedding_size=100, num_layers=1,
          keep_prob=1.0, batch_size=64, num_itr=200, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
          train_tfrecords='./data/annakarenina_char-train.tfrecord',
          eval_tfrecords='./data/annakarenina_char-eval.tfrecord',
          model_dir="./checkpoints")
-    m.train()
+    #m.train()
     m.generate()
 
 if __name__ == "__main__":

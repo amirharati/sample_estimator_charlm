@@ -61,7 +61,7 @@ chars = sorted(chars)
 # for words add start, end and pad symboles
 words = ["<PAD>", "<START>", "<EOS>"] + words
 # for chars in addition to above add space
-chars = ["<PAD>", "<START>", "<EOS>", " "] + chars
+chars = ["<PAD>", "<START>", "<EOS>"," "] + chars
 
 words_to_ids = {w: id for id, w in enumerate(words)}
 ids_to_words = {words_to_ids[x]: x for x in words_to_ids}

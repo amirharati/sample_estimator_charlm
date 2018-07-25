@@ -57,6 +57,7 @@ class DataPreppy():
     ex = tf.train.SequenceExample()
     # A non-sequential feature of our example
     sequence_length = len(sequence)
+
     # +2 For start and end
     ex.context.feature["length"].int64_list.value.append(sequence_length + 2)
     # Feature lists for the two sequential features of our example

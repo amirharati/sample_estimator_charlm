@@ -13,15 +13,9 @@ import tensorflow as tf
 import numpy as np
 from tensorflow.python.layers.core import Dense
 import logging
+from tensorflow.contrib import layers
 
-# Fix for chnaging len error:
-# from: https://github.com/tensorflow/nmt/issues/117
-class FixedHelper(tf.contrib.seq2seq.GreedyEmbeddingHelper):
-    def sample(self, *args, **kwargs):
-        batch_size = 1
-        result = super().sample(*args, **kwargs)
-        result.set_shape([batch_size])
-        return result
+
 
 class RnnLmS2S:
     def __init__(self, model_size, embedding_size, num_layers,
@@ -47,11 +41,27 @@ class RnnLmS2S:
         """
             train the custom estimator.
         """
+        print_logs = tf.train.LoggingTensorHook(
+        ['train_pred', "predictions"], every_n_iter=100,
+             formatter=self.get_formatter(['train_pred', 'predictions'], self.vocabs))
         est = tf.estimator.Estimator(
             model_fn=self._model,
             model_dir=self.model_dir,
             params=self.params)
-        est.train(self._train_input_fn, steps=self.num_itr)
+        est.train(self._train_input_fn, hooks=[print_logs], steps=self.num_itr)
+    def get_formatter(self, keys, vocab):
+    
+
+        def to_str(sequence):
+            tokens = [self.reverse_vocabs[x] for x in sequence]
+            return ' '.join(tokens)
+
+        def format(values):
+            res = []
+            for key in keys:
+                res.append("%s = %s" % (key, to_str(values[key]) ))
+            return '\n'.join(res)
+        return format
 
     def generate(self):
         """
@@ -67,15 +77,38 @@ class RnnLmS2S:
             warm_start_from=self.model_dir)
         
         current_seq_ind = []
+        # dummy seq.
         X = np.zeros((1, 1), dtype=np.int32)
-        X[0, 0] = 0
+        X[0, 0] = 1
         predict_input_fn = tf.estimator.inputs.numpy_input_fn(
             x={"seq": X},
             num_epochs=1,
             shuffle=False)
             
         result = est.predict(input_fn=predict_input_fn)
-        print(next(result))
+        #print(next(result))
+        g = next(result)
+        probs = g["probs"]
+        syms = g["syms"]
+        #print(len(probs))
+        
+
+        for p in probs:
+            ind_sample = np.random.choice(range(0, self.vocab_size), p=p.ravel())
+            #ind_sample = np.argmax(p.ravel())
+            current_seq_ind.append(ind_sample)
+
+        self.reverse_vocabs[3] = " "
+        out_str = ""
+        out_str2 = ""
+        #print(syms)
+        #print(current_seq_ind)
+        for c in current_seq_ind:
+            out_str += self.reverse_vocabs[c] + " " 
+        for c in syms:
+            out_str2 += self.reverse_vocabs[c] + " "
+        print("argmax: ", out_str2)
+        print("sampling: ", out_str)
 
     def _train_input_fn(self):
         return DP.DataPreppy.make_dataset(self.train_tfrecords, "train", self.batch_size)
@@ -88,141 +121,122 @@ class RnnLmS2S:
         """
             main model.
         """
-        # labels is None in this case since we use features as labels in LM
-        # How to update the params such as keep_prob during training? It seems we need to divide the  training into chunks
-        # and check for conditons in between chunks.
-        
-        #if mode == tf.estimator.ModeKeys.PREDICT:
-        #    lengths = 0 
-
-        #else:
-        if mode == tf.estimator.ModeKeys.TRAIN:
-            lengths = features['length']
-            sequence = features['seq']
-            batch_size = tf.shape(sequence)[0]
-            start_token = tf.ones([self.vocabs["<START>"]], tf.int32) 
-        elif mode == tf.estimator.ModeKeys.PREDICT:
-            start_token = tf.ones([self.vocabs["<START>"]], tf.int32) # update this
-            batch_size = 1
-            #sequence = self.vocabs["<START>"]
-            sequence = features['seq']
-            lengths = [1]
-
+        sequence = features['seq']
+        batch_size = tf.shape(sequence)[0]
+        start_token = tf.ones([1], tf.int32) 
+    
         model_size = params["model_size"]
         num_layers = params["num_layers"]
         keep_prob = params["keep_prob"]
         vocab_size = params["vocab_size"]
         embedding_size = params["embedding_size"]
 
-        with tf.variable_scope("main", initializer=tf.contrib.layers.xavier_initializer()):
-            embedding = tf.get_variable("embedding",
-            [vocab_size, embedding_size], dtype=tf.float32)
-            #if mode == tf.estimator.ModeKeys.TRAIN:
-            embed_seq = tf.nn.embedding_lookup(embedding, sequence)
-            output_lengths = tf.reduce_sum(tf.to_int32(tf.not_equal(sequence, 0)), 1)  #update this
-            train_helper = tf.contrib.seq2seq.TrainingHelper(embed_seq, output_lengths)
-            #if mode == tf.estimator.ModeKeys.PREDICT:
-            pred_helper = FixedHelper(embedding, 
-                    start_tokens=tf.to_int32(start_token), end_token=2) # update this
+        #tf.identity(sequence[0], name='seq')
+        # embedding layer.
+        embed_seq = layers.embed_sequence(
+        sequence, vocab_size=vocab_size, embed_dim=embedding_size, scope="embed")
+        with tf.variable_scope('embed', reuse=True):
+            embeddings = tf.get_variable('embeddings')
+       
+        # find the lengths of training seq.
+        # should use <PAD> or  <EOS>? <PAD> seems more accurate but <EOS> prob works too.
+        lengths = tf.reduce_sum(tf.to_int32(tf.not_equal(sequence, self.vocabs["<PAD>"])), 1)
+        #tf.identity(lengths, name='lengths')
+     
+        # helpers
+        train_helper = tf.contrib.seq2seq.TrainingHelper(embed_seq, lengths, time_major=False)
+        start_tokens = tf.tile(tf.constant([self.vocabs['<START>']], dtype=tf.int32), [batch_size], name='start_tokens')
+        pred_helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(embeddings, 
+                    start_tokens=start_tokens, end_token=self.vocabs["<EOS>"])
 
-            def decode(helper, scope, reuse=None):
-                with tf.variable_scope(scope, reuse=reuse):
-                    cells = []
-                    for i in range(num_layers):
-                        c = tf.nn.rnn_cell.GRUCell(model_size)
-                        c = tf.nn.rnn_cell.DropoutWrapper(c, input_keep_prob=keep_prob,
-                                                        output_keep_prob=keep_prob)
-                        cells.append(c)   
-                    cell = tf.nn.rnn_cell.MultiRNNCell(cells) 
-                    #out_cell = tf.contrib.rnn.OutputProjectionWrapper(cell, vocab_size, reuse=reuse)
-                    projection_layer = Dense(units=vocab_size, use_bias=True, name="logits")
-                    decoder = tf.contrib.seq2seq.BasicDecoder(
-                        cell=cell, helper=helper,
-                        initial_state=cell.zero_state(dtype=tf.float32, batch_size=batch_size),
-                        output_layer=projection_layer)
-                    outputs, _, _ = tf.contrib.seq2seq.dynamic_decode(
-                        decoder=decoder, output_time_major=False,
-                        impute_finished=True)
-                    return outputs
-            #if mode == tf.estimator.ModeKeys.TRAIN:
-            train_outputs = decode(train_helper, 'decode')
-            #elif mode == tf.estimator.ModeKeys.PREDICT:
-            pred_outputs = decode(pred_helper, 'decode', reuse=True)
-            if mode == tf.estimator.ModeKeys.TRAIN:
-                outputs = train_outputs.rnn_output
-            elif mode == tf.estimator.ModeKeys.PREDICT:
-                outputs = pred_outputs.rnn_output
+        # rnn cell and dense layer
+        #cell = tf.contrib.rnn.GRUCell(num_units=model_size)
+        cells = []
+        for i in range(num_layers):
+            c = tf.nn.rnn_cell.GRUCell(model_size)
+            c = tf.nn.rnn_cell.DropoutWrapper(c, input_keep_prob=keep_prob,
+                                            output_keep_prob=keep_prob)
+            cells.append(c)
+        # I cant figure out how to use tuple version.    
+        cell = tf.nn.rnn_cell.MultiRNNCell(cells)
+        projection_layer = Dense(units=vocab_size,
+         kernel_initializer = tf.truncated_normal_initializer(mean = 0.0, stddev=0.1))
 
-            # run the rnn
-            #if mode == tf.estimator.ModeKeys.PREDICT:            
-            #    outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, initial_state=init_state, scope="DRNN")
-            #else:
-            #    outputs, state = tf.nn.dynamic_rnn(cell, embed_seq, dtype=tf.float32, sequence_length=lengths, scope="DRNN")
-    
-            if mode == tf.estimator.ModeKeys.TRAIN:
-                targets = sequence[:, 1:]
-                # for predict we use the output for train exclude the last timestep
-                outputs = outputs[:, :-1, :]
-
-            with tf.variable_scope("softmax"):
-                logits = outputs
-                # alternatively we can remove projection layer above and change the logits to below.
-                #logits = tf.layers.dense(outputs, vocab_size, None, name="logits")
-                
-                # probablities.
-                probs = tf.nn.softmax(logits, name="probs")
-                # in case in prediction mode return
-                if mode == tf.estimator.ModeKeys.PREDICT:
-                        return tf.estimator.EstimatorSpec(
-                            mode=mode,
-                            predictions={"probs": probs})
-
-                mask = tf.sign(tf.abs(tf.cast(targets, dtype=tf.float32)))
-                loss = tf.contrib.seq2seq.sequence_loss(logits, targets,
-                                                        mask,
-                                                        average_across_timesteps=False,
-                                                        average_across_batch=True)
-                # alternative loss
-                #loss = tf.losses.sparse_softmax_cross_entropy(targets,
-                #                                       logits,
-                #                                       weights=mask)
+        # deocder in seq2seq model. For this case we don't have an encoder.
+        def decode(helper, scope, output_max_length,reuse=None):
+            with tf.variable_scope(scope, reuse=reuse):
+                decoder = tf.contrib.seq2seq.BasicDecoder(
+                    cell=cell, helper=helper,
+                    initial_state=cell.zero_state(
+                        dtype=tf.float32, batch_size=batch_size),
+                         output_layer=projection_layer)
+                outputs = tf.contrib.seq2seq.dynamic_decode(
+                    decoder=decoder, output_time_major=False,
+                    impute_finished=True, maximum_iterations=output_max_length
+                )
+            return outputs[0]
+        train_outputs = decode(train_helper, 'decode', 3000)
+        pred_outputs = decode(pred_helper, 'decode', 300,reuse=True)
 
 
-            # compute the loss and also predictions
-            loss = tf.reduce_mean(loss)
-            tf.summary.scalar("loss", loss)
-            with tf.variable_scope("train_op"):
-                learning_rate = tf.Variable(0.0, trainable=False)
-                initial_learning_rate = tf.constant(0.001)
-                learning_rate = tf.train.exponential_decay(initial_learning_rate,
-                                                        tf.train.get_global_step(), 100, 0.99)
-                tf.summary.scalar("learning_rate", learning_rate)
-                tvars = tf.trainable_variables()
-                grads, _ = tf.clip_by_global_norm(tf.gradients(loss, tvars), 5)
-                optimizer = tf.train.AdamOptimizer(learning_rate)
-                # Visualise gradients
-                vis_grads = [0 if i is None else i for i in grads]
-                for g in vis_grads:
-                    tf.summary.histogram("gradients_" + str(g), g)
-                train_op = optimizer.apply_gradients(zip(grads, tvars),
-                 global_step=tf.train.get_global_step())
+        targets = sequence[:, 1:]
 
-            return tf.estimator.EstimatorSpec(
-                mode=mode,
-                predictions=None,
-                loss=loss,
-                train_op=train_op
-            )
+        probs = tf.nn.softmax(pred_outputs.rnn_output, name="probs")
+        # in case in prediction mode return
+        if mode == tf.estimator.ModeKeys.PREDICT:
+                return tf.estimator.EstimatorSpec(
+                    mode=mode,
+                    predictions={"probs": probs, "syms": pred_outputs.sample_id})
+
+        # mask the PADs    
+        mask = tf.to_float(tf.not_equal(sequence[:, :-1], self.vocabs["<PAD>"]))
+
+        #tf.identity(mask[0], name='mask')
+        #tf.identity(targets[0], name='targets')
+        #tf.identity(train_outputs.rnn_output[0,output_lengths[0]-2:output_lengths[0],:], name='rnn_out')
+        # Loss function
+        loss = tf.contrib.seq2seq.sequence_loss(
+            train_outputs.rnn_output[:,:-1,:],
+            targets,
+            mask)
+        tf.summary.scalar("loss", loss)
+
+        # Optimizer
+        learning_rate = tf.Variable(0.0, trainable=False)
+        initial_learning_rate = tf.constant(0.001)
+        learning_rate = tf.train.exponential_decay(initial_learning_rate,
+                                                    tf.train.get_global_step(), 100, 0.99)
+        tf.summary.scalar("learning_rate", learning_rate)
+        tvars = tf.trainable_variables()
+        grads, _ = tf.clip_by_global_norm(tf.gradients(loss, tvars), 5.0)
+        optimizer = tf.train.AdamOptimizer(learning_rate)
+        # Visualise gradients
+        vis_grads = [0 if i is None else i for i in grads]
+        for g in vis_grads:
+            tf.summary.histogram("gradients_" + str(g), g)
+        train_op = optimizer.apply_gradients(zip(grads, tvars),
+            global_step=tf.train.get_global_step())
+        
+        tf.identity(train_outputs.sample_id[0], name='train_pred')
+        tf.identity(pred_outputs.sample_id[0], name='predictions')
+        return tf.estimator.EstimatorSpec(
+            mode=mode,
+            predictions=None,
+            loss=loss,
+            train_op=train_op
+        )
 
 def test():
     tf.logging.set_verbosity(logging.DEBUG)
     dpp = DP.DataPreppy("char", "./data/annakarenina_chars2id.txt", "", "")
-    m = RnnLmS2S(model_size=128, embedding_size=100, num_layers=1,
-         keep_prob=1.0, batch_size=64, num_itr=200, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
+    m = RnnLmS2S(model_size=512, embedding_size=100, num_layers=2,
+         keep_prob=1.0, batch_size=32, num_itr=500, vocabs=dpp.vocabs, reverse_vocabs=dpp.reverse_vocabs,
          train_tfrecords='./data/annakarenina_char-train.tfrecord',
-         eval_tfrecords='./data/annakarenina_char-eval.tfrecord',
+         eval_tfrecords='./data/annakarenina_char-val.tfrecord',
          model_dir="./checkpoints")
-    #m.train()
+    print(dpp.vocabs)
+    print(len(dpp.vocabs))
+    m.train()
     m.generate()
 
 if __name__ == "__main__":
